@@ -1,0 +1,850 @@
+#!/usr/bin/env python3
+"""
+DEB 包溯源管理脚本
+列出远端服务器上的 DEB 包信息，并支持与本地已安装包对比
+"""
+
+import argparse
+import html
+import re
+import subprocess
+import sys
+from datetime import datetime, timedelta
+from dataclasses import dataclass
+from pathlib import Path
+from tempfile import NamedTemporaryFile
+from typing import Dict, List, Optional, Tuple
+from urllib.request import urlopen, Request, urlretrieve
+
+# ===== 硬编码配置 =====
+DEFAULT_URL = "http://10.111.185.212/deb/amd64/"
+DEFAULT_ARCH = "amd64"
+# 所有功能默认启用：对比本地包、只显示最新版本
+
+# ===== 包名映射表 =====
+# 将文件名解析出的包名映射到实际的 dpkg 包名
+PACKAGE_NAME_MAPPING = {
+    "mech-eye_api": "mecheyeapi",  # Mech-Eye_API -> mecheyeapi
+}
+
+# ANSI 颜色代码
+GREEN = "\033[32m"
+BLUE = "\033[34m"
+YELLOW = "\033[33m"
+RED = "\033[31m"
+NC = "\033[0m"  # No Color
+
+
+@dataclass
+class DebPackage:
+    """DEB 包信息数据类"""
+    name: str
+    version: str
+    arch: str
+    filename: str
+    size: str = ""
+    date: str = ""
+    source: str = "remote"  # "local" or "remote"
+
+
+def parse_html_packages(html_content: str) -> List[Dict[str, str]]:
+    """
+    解析 Apache 目录索引 HTML，提取 .deb 文件信息
+    
+    Args:
+        html_content: HTML 内容
+        
+    Returns:
+        包信息列表，每个元素包含 filename, date, size
+    """
+    packages = []
+    
+    # 按行解析，每行可能包含一个 .deb 文件
+    lines = html_content.split('\n')
+    
+    for line in lines:
+        # 查找 .deb 链接
+        deb_match = re.search(r'<a\s+href="([^"]*\.deb)"[^>]*>.*?</a>', line, re.IGNORECASE)
+        if not deb_match:
+            continue
+        
+        filename = html.unescape(deb_match.group(1))
+        
+        # 从当前行提取日期和大小
+        # 移除 HTML 标签，只保留文本
+        text = re.sub(r'<[^>]+>', ' ', line)
+        text = ' '.join(text.split())  # 规范化空白字符
+        
+        date_str = ""
+        size_str = ""
+        
+        # 尝试提取日期格式: DD-Mon-YYYY HH:MM 或 DD-Mon-YYYY
+        # 格式示例: 11-Nov-2025 08:21
+        date_match = re.search(r'(\d{1,2}-[A-Za-z]{3}-\d{4})(?:\s+(\d{2}:\d{2}))?', text)
+        if date_match:
+            if date_match.group(2):
+                date_str = f"{date_match.group(1)} {date_match.group(2)}"
+            else:
+                date_str = date_match.group(1)
+        
+        # 提取大小：匹配该行中最后一个数字+单位的组合（通常是文件大小）
+        # 格式示例: 177M, 13M
+        size_matches = re.findall(r'(\d+(?:\.\d+)?)\s*([KMGTP])', text, re.IGNORECASE)
+        if size_matches:
+            # 取最后一个匹配（通常是文件大小）
+            last_match = size_matches[-1]
+            size_str = f"{last_match[0]}{last_match[1].upper()}"
+        else:
+            # 备用：尝试匹配任何数字+单位的组合
+            size_matches_alt = re.findall(r'(\d+\.?\d*[KMGTP])', text, re.IGNORECASE)
+            if size_matches_alt:
+                size_str = size_matches_alt[-1].upper()
+        
+        packages.append({
+            "filename": filename,
+            "date": date_str,
+            "size": size_str
+        })
+    
+    return packages
+
+
+class LocalPackageManager:
+    """管理本地已安装的包"""
+    
+    @staticmethod
+    def get_installed_packages() -> List[DebPackage]:
+        """
+        查询本地已安装的包
+        
+        Returns:
+            已安装的包列表
+        """
+        packages = []
+        try:
+            # 使用 dpkg-query 获取所有已安装的包
+            result = subprocess.run(
+                ["dpkg-query", "-W", "-f=${Status}\t${Package}\t${Version}\n"],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            
+            for line in result.stdout.splitlines():
+                if not line.strip():
+                    continue
+                
+                # 格式: install ok installed\tpackage-name\tversion
+                parts = line.split("\t")
+                if len(parts) >= 3 and parts[0] == "install ok installed":
+                    pkg_name = parts[1]
+                    pkg_version = parts[2]
+                    
+                    # 标准化包名（转小写）
+                    pkg_name_lower = pkg_name.lower()
+                    
+                    # 尝试检测架构
+                    arch = LocalPackageManager._detect_arch(pkg_name)
+                    
+                    packages.append(DebPackage(
+                        name=pkg_name_lower,
+                        version=pkg_version,
+                        arch=arch,
+                        filename="",
+                        size="",
+                        date="",
+                        source="local"
+                    ))
+        except subprocess.CalledProcessError as e:
+            print(f"⚠️  无法查询本地包: {e}", file=sys.stderr)
+        except FileNotFoundError:
+            print("⚠️  dpkg-query 命令未找到，跳过本地包查询", file=sys.stderr)
+        
+        return packages
+    
+    @staticmethod
+    def _detect_arch(package_name: str) -> str:
+        """尝试从包名检测架构"""
+        if "amd64" in package_name.lower() or "x86_64" in package_name.lower():
+            return "amd64"
+        elif "arm64" in package_name.lower() or "aarch64" in package_name.lower():
+            return "arm64"
+        return "unknown"
+
+
+class RemotePackageManager:
+    """管理远程服务器上的包"""
+    
+    @staticmethod
+    def fetch_packages(url: str, arch: str) -> List[DebPackage]:
+        """
+        从远程获取包列表
+        
+        Args:
+            url: 远程服务器 URL
+            arch: 架构
+            
+        Returns:
+            远程包列表
+        """
+        packages = []
+        
+        # 确保 URL 以 / 结尾
+        if not url.endswith("/"):
+            url += "/"
+        
+        try:
+            # 获取 HTML 内容
+            req = Request(url)
+            req.add_header("User-Agent", "Mozilla/5.0")
+            
+            with urlopen(req, timeout=10) as response:
+                html_content = response.read().decode("utf-8", errors="ignore")
+            
+            # 解析 HTML
+            pkg_info_list = parse_html_packages(html_content)
+            
+            # 转换为 DebPackage 对象
+            for pkg_info in pkg_info_list:
+                filename = pkg_info["filename"]
+                pkg_name, pkg_version = RemotePackageManager.parse_package_info(filename)
+                
+                packages.append(DebPackage(
+                    name=pkg_name,
+                    version=pkg_version,
+                    arch=arch,
+                    filename=filename,
+                    size=pkg_info.get("size", ""),
+                    date=pkg_info.get("date", ""),
+                    source="remote"
+                ))
+        
+        except Exception as e:
+            print(f"❌ 无法访问服务器 {url}: {e}", file=sys.stderr)
+            return []
+        
+        return packages
+    
+    @staticmethod
+    def parse_package_info(filename: str) -> Tuple[str, str]:
+        """
+        从文件名提取包名和版本
+        
+        支持格式：
+        - Mech-Eye_API_2.4.1_amd64.deb -> Mech-Eye_API, 2.4.1
+        - aubo-sdk_0.26.0-rc.2_amd64.deb -> aubo-sdk, 0.26.0-rc.2
+        - behaviortree-cpp_4.6.2-1_amd64.deb -> behaviortree-cpp, 4.6.2-1
+        - package_version_arch.deb
+        - package-version_arch.deb
+        
+        Args:
+            filename: 文件名
+            
+        Returns:
+            (包名, 版本号) 元组
+        """
+        # 移除 .deb 后缀
+        basename = filename.replace(".deb", "")
+        
+        # 移除架构后缀（只匹配已知的架构名称，避免误删版本号中的 -1 等 Debian revision）
+        # 支持的架构：amd64, arm64, x86_64, aarch64, i386, armhf, armel 等
+        basename = re.sub(r'_(amd64|arm64|x86_64|aarch64|i386|armhf|armel|ppc64el|s390x)$', '', basename, flags=re.IGNORECASE)
+        basename = re.sub(r'-(amd64|arm64|x86_64|aarch64|i386|armhf|armel|ppc64el|s390x)$', '', basename, flags=re.IGNORECASE)
+        
+        # 尝试从后往前匹配版本号（版本号通常以数字开头）
+        # 匹配最后一个下划线后的数字部分
+        if re.search(r'_[0-9]', basename):
+            match = re.match(r'^(.+?)_([0-9].*)$', basename)
+            if match:
+                return match.group(1), match.group(2)
+        
+        # 匹配最后一个连字符后的数字部分
+        if re.search(r'-[0-9]', basename):
+            match = re.match(r'^(.+?)-([0-9].*)$', basename)
+            if match:
+                return match.group(1), match.group(2)
+        
+        # 如果无法解析，返回原文件名作为包名
+        return basename, "unknown"
+
+
+class PackageComparator:
+    """版本对比和状态判断"""
+    
+    @staticmethod
+    def compare_versions(v1: str, v2: str) -> int:
+        """
+        比较版本号
+        
+        Args:
+            v1: 版本号1
+            v2: 版本号2
+            
+        Returns:
+            0=相等, 1=v1>v2, 2=v1<v2
+        """
+        if v1 == "unknown" or v2 == "unknown":
+            return -1  # 无法比较
+        
+        try:
+            # 使用 dpkg --compare-versions 进行版本比较
+            result = subprocess.run(
+                ["dpkg", "--compare-versions", v1, "gt", v2],
+                capture_output=True,
+                check=False
+            )
+            if result.returncode == 0:
+                return 1  # v1 > v2
+            
+            result = subprocess.run(
+                ["dpkg", "--compare-versions", v1, "lt", v2],
+                capture_output=True,
+                check=False
+            )
+            if result.returncode == 0:
+                return 2  # v1 < v2
+            
+            return 0  # v1 == v2
+        except Exception:
+            return -1  # 比较失败
+    
+    @staticmethod
+    def get_status(remote_pkg: DebPackage, local_pkg: Optional[DebPackage]) -> str:
+        """
+        获取包的状态
+        
+        Args:
+            remote_pkg: 远程包信息
+            local_pkg: 本地包信息（可选）
+            
+        Returns:
+            状态字符串
+        """
+        if local_pkg is None:
+            return f"{RED}未安装{NC}"
+        
+        if remote_pkg.version == "unknown":
+            return f"{RED}版本未知 (本地: {local_pkg.version}){NC}"
+        
+        cmp_result = PackageComparator.compare_versions(remote_pkg.version, local_pkg.version)
+        
+        if cmp_result == 0:
+            return f"{GREEN}已安装 ({local_pkg.version}){NC}"
+        elif cmp_result == 1:
+            return f"{YELLOW}可更新 (本地: {local_pkg.version}){NC}"
+        elif cmp_result == 2:
+            return f"{YELLOW}较旧 (本地: {local_pkg.version}){NC}"
+        else:
+            return f"{YELLOW}版本不同 (本地: {local_pkg.version}){NC}"
+
+
+def format_date(date_str: str) -> str:
+    """
+    格式化日期字符串
+    
+    Args:
+        date_str: 原始日期字符串（如 "11-Nov-2025 04:41"）
+        
+    Returns:
+        格式化后的日期字符串（如 "2025-11-11 04:41"）
+    """
+    if not date_str:
+        return "-"
+    
+    # 尝试转换日期格式：11-Nov-2025 04:41 -> 2025-11-11 04:41
+    match = re.match(r'(\d{2})-([A-Za-z]{3})-(\d{4})(?:\s+(\d{2}:\d{2}))?', date_str)
+    if match:
+        day = match.group(1)
+        month_str = match.group(2)
+        year = match.group(3)
+        time = match.group(4) or ""
+        
+        # 月份转换
+        month_map = {
+            "Jan": "01", "Feb": "02", "Mar": "03", "Apr": "04",
+            "May": "05", "Jun": "06", "Jul": "07", "Aug": "08",
+            "Sep": "09", "Oct": "10", "Nov": "11", "Dec": "12"
+        }
+        month = month_map.get(month_str, "??")
+        
+        if time:
+            return f"{year}-{month}-{day} {time}"
+        else:
+            return f"{year}-{month}-{day}"
+    
+    return date_str
+
+
+def get_latest_packages(packages: List[DebPackage]) -> List[DebPackage]:
+    """
+    按包名分组并选择最新版本
+    
+    Args:
+        packages: 包列表
+        
+    Returns:
+        只包含最新版本的包列表
+    """
+    latest_map: Dict[str, DebPackage] = {}
+    
+    for pkg in packages:
+        # 使用包名（转小写）作为键
+        pkg_key = pkg.name.lower()
+        
+        if pkg_key not in latest_map:
+            latest_map[pkg_key] = pkg
+        else:
+            # 比较版本，选择更新的
+            existing_pkg = latest_map[pkg_key]
+            if pkg.version != "unknown" and existing_pkg.version != "unknown":
+                cmp_result = PackageComparator.compare_versions(pkg.version, existing_pkg.version)
+                if cmp_result == 1:  # 当前版本更新
+                    latest_map[pkg_key] = pkg
+    
+    return list(latest_map.values())
+
+
+def strip_ansi_codes(text: str) -> str:
+    """移除 ANSI 颜色代码"""
+    return re.sub(r'\033\[[0-9;]*m', '', text)
+
+
+def get_display_width(text: str) -> int:
+    """获取去除 ANSI 代码后的显示宽度"""
+    return len(strip_ansi_codes(text))
+
+
+def pad_with_ansi(text: str, width: int) -> str:
+    """在带 ANSI 代码的文本后添加空格以达到指定宽度"""
+    display_width = get_display_width(text)
+    padding = max(0, width - display_width)
+    return text + ' ' * padding
+
+
+def format_table(packages: List[DebPackage], local_packages: Dict[str, DebPackage]) -> None:
+    """
+    格式化并显示包信息表格
+    
+    Args:
+        packages: 远程包列表
+        local_packages: 本地包字典（包名 -> DebPackage）
+    """
+    # 列宽定义
+    COL_WIDTH_NAME = 40
+    COL_WIDTH_VERSION = 25
+    COL_WIDTH_DATE = 20
+    COL_WIDTH_SIZE = 10
+    COL_WIDTH_STATUS = 30
+    
+    # 打印表头
+    header = (
+        f"{'包名':<{COL_WIDTH_NAME}} "
+        f"{'版本号':<{COL_WIDTH_VERSION}} "
+        f"{'最后更新时间':<{COL_WIDTH_DATE}} "
+        f"{'大小':>{COL_WIDTH_SIZE}} "
+        f"{'本地状态':<{COL_WIDTH_STATUS}}"
+    )
+    print(header)
+    
+    # 计算分隔线长度
+    total_width = COL_WIDTH_NAME + COL_WIDTH_VERSION + COL_WIDTH_DATE + COL_WIDTH_SIZE + COL_WIDTH_STATUS + 4
+    print("-" * total_width)
+    
+    # 显示每个包
+    for pkg in packages:
+        formatted_date = format_date(pkg.date)
+        size_str = (pkg.size if pkg.size else "-").strip()
+        
+        # 获取本地包（大小写不敏感）
+        pkg_key = pkg.name.lower()
+        local_pkg = local_packages.get(pkg_key)
+        
+        # 如果直接匹配失败，尝试通过映射表查找
+        if local_pkg is None and pkg_key in PACKAGE_NAME_MAPPING:
+            mapped_name = PACKAGE_NAME_MAPPING[pkg_key]
+            local_pkg = local_packages.get(mapped_name)
+        
+        # 获取状态
+        status = PackageComparator.get_status(pkg, local_pkg)
+        
+        # 打印行（状态列使用特殊处理以支持 ANSI 颜色代码）
+        name_str = pkg.name[:COL_WIDTH_NAME] if len(pkg.name) > COL_WIDTH_NAME else pkg.name
+        version_str = pkg.version[:COL_WIDTH_VERSION] if len(pkg.version) > COL_WIDTH_VERSION else pkg.version
+        date_str = formatted_date[:COL_WIDTH_DATE] if len(formatted_date) > COL_WIDTH_DATE else formatted_date
+        size_display = size_str[:COL_WIDTH_SIZE] if len(size_str) > COL_WIDTH_SIZE else size_str
+        
+        row = (
+            f"{name_str:<{COL_WIDTH_NAME}} "
+            f"{version_str:<{COL_WIDTH_VERSION}} "
+            f"{date_str:<{COL_WIDTH_DATE}} "
+            f"{size_display:>{COL_WIDTH_SIZE}} "
+            f"{pad_with_ansi(status, COL_WIDTH_STATUS)}"
+        )
+        print(row)
+
+
+def handle_info(args: argparse.Namespace) -> None:
+    """处理 info 命令"""
+    # 构建 URL（如果 URL 不包含架构，自动添加）
+    url = DEFAULT_URL
+    if f"/{DEFAULT_ARCH}/" not in url and not url.endswith(f"/{DEFAULT_ARCH}"):
+        url = url.rstrip("/") + f"/{DEFAULT_ARCH}/"
+        
+    # 获取远程包列表
+    remote_packages = RemotePackageManager.fetch_packages(url, DEFAULT_ARCH)
+    
+    if not remote_packages:
+        print("⚠️  未找到任何 .deb 包")
+        return
+    
+    # 只显示最新版本
+    remote_packages = get_latest_packages(remote_packages)
+    
+    # 获取本地包列表
+    local_packages_list = LocalPackageManager.get_installed_packages()
+    
+    # 创建本地包的映射表（包名 -> DebPackage，支持大小写不敏感匹配）
+    local_packages: Dict[str, DebPackage] = {}
+    for pkg in local_packages_list:
+        pkg_key = pkg.name.lower()
+        local_packages[pkg_key] = pkg
+    
+    # 显示包信息
+    format_table(remote_packages, local_packages)
+
+
+def handle_install(args: argparse.Namespace) -> None:
+    """处理 install 命令"""
+    installer = PackageInstaller(DEFAULT_URL, DEFAULT_ARCH)
+    installer.install(args.package)
+
+
+def handle_uninstall(args: argparse.Namespace) -> None:
+    """处理 uninstall 命令"""
+    installer = PackageInstaller(DEFAULT_URL, DEFAULT_ARCH)
+    installer.uninstall(args.package)
+
+
+def handle_history(args: argparse.Namespace) -> None:
+    """处理 history 命令，只显示远程服务器相关的包历史"""
+    history = InstallHistory()
+    
+    # 获取远程包列表，用于过滤
+    url = DEFAULT_URL
+    if f"/{DEFAULT_ARCH}/" not in url and not url.endswith(f"/{DEFAULT_ARCH}"):
+        url = url.rstrip("/") + f"/{DEFAULT_ARCH}/"
+    
+    remote_packages = RemotePackageManager.fetch_packages(url, DEFAULT_ARCH)
+    remote_packages = get_latest_packages(remote_packages)
+    
+    # 创建远程包名集合（大小写不敏感）
+    remote_package_names = {pkg.name.lower() for pkg in remote_packages}
+    
+    if args.package:
+        # 显示指定包的历史
+        package_name_lower = args.package.lower()
+        
+        # 检查包是否在远程列表中
+        if package_name_lower not in remote_package_names:
+            print(f"⚠️  包 {args.package} 不在远程服务器列表中")
+            return
+        
+        records = history.get_package_history(args.package)
+        if not records:
+            print(f"⚠️  未找到包 {args.package} 的历史记录")
+            return
+        
+        print(f"包 {args.package} 的历史记录：")
+        print(f"{'时间':<20} {'操作':<10} {'版本':<30} {'架构':<10}")
+        print("-" * 70)
+        for record in records:
+            print(f"{record.timestamp:<20} {record.operation:<10} {record.version:<30} {record.arch:<10}")
+    else:
+        # 显示最近的历史记录，但只显示远程服务器相关的包
+        all_records = history.get_recent_history(args.days)
+        
+        # 过滤：只保留在远程包列表中的包
+        filtered_records = [
+            record for record in all_records
+            if record.package_name.lower() in remote_package_names
+        ]
+        
+        if not filtered_records:
+            print(f"⚠️  最近 {args.days} 天没有相关包的历史记录")
+            return
+        
+        print(f"最近 {args.days} 天相关包的历史记录：")
+        print(f"{'时间':<20} {'操作':<10} {'包名':<40} {'版本':<30}")
+        print("-" * 100)
+        for record in filtered_records:
+            print(f"{record.timestamp:<20} {record.operation:<10} {record.package_name:<40} {record.version:<30}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """构建命令行参数解析器"""
+    parser = argparse.ArgumentParser(description="DEB 包管理工具")
+    subparsers = parser.add_subparsers(dest="command", help="子命令")
+    
+    # info 命令（默认）
+    info_parser = subparsers.add_parser("info", help="列出包信息")
+    info_parser.set_defaults(func=handle_info)
+    
+    # install 命令
+    install_parser = subparsers.add_parser("install", help="安装包")
+    install_parser.add_argument("package", help="包名")
+    install_parser.set_defaults(func=handle_install)
+    
+    # uninstall 命令
+    uninstall_parser = subparsers.add_parser("uninstall", help="卸载包")
+    uninstall_parser.add_argument("package", help="包名")
+    uninstall_parser.set_defaults(func=handle_uninstall)
+    
+    # history 命令
+    history_parser = subparsers.add_parser("history", help="显示安装历史")
+    history_parser.add_argument("package", nargs="?", help="包名（可选）")
+    history_parser.add_argument("--days", type=int, default=30, help="显示最近 N 天的历史（默认30天）")
+    history_parser.set_defaults(func=handle_history)
+    
+    return parser
+
+
+def main():
+    """主函数"""
+    parser = build_parser()
+    args = parser.parse_args()
+    
+    # 如果没有指定命令，显示帮助信息
+    if not args.command:
+        parser.print_help()
+        return
+    
+    # 执行对应的处理函数
+    if hasattr(args, "func") and args.func:
+        args.func(args)
+    else:
+        parser.print_help()
+
+
+@dataclass
+class HistoryRecord:
+    """安装历史记录数据类"""
+    timestamp: str
+    operation: str  # "install", "remove", "purge"
+    package_name: str
+    version: str
+    arch: str = ""
+
+
+class InstallHistory:
+    """从系统 dpkg 日志读取安装历史记录"""
+    
+    def __init__(self):
+        self.dpkg_log = Path("/var/log/dpkg.log")
+        self.apt_log = Path("/var/log/apt/history.log")
+    
+    def _parse_dpkg_log(self) -> List[HistoryRecord]:
+        """解析 dpkg.log 文件"""
+        records = []
+        
+        if not self.dpkg_log.exists():
+            return records
+        
+        try:
+            with open(self.dpkg_log, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    
+                    # dpkg.log 格式示例:
+                    #   2025-11-01 18:49:35 install nomachine:amd64 <无> 9.2.18-3
+                    #   2025-11-01 18:49:35 status installed nomachine:amd64 9.2.18-3
+                    #   2025-11-01 18:49:35 remove nomachine:amd64 9.2.18-3 <无>
+                    
+                    # 匹配 status installed/removed/purged 行（状态行）
+                    status_match = re.match(
+                        r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) status (installed|removed|purged) (.+?)(?::([a-z0-9]+))? (.+)',
+                        line
+                    )
+                    if status_match:
+                        timestamp = status_match.group(1)
+                        operation = status_match.group(2)
+                        package_name = status_match.group(3)
+                        arch = status_match.group(4) or ""
+                        version = status_match.group(5).strip()
+                        
+                        # 标准化操作名称
+                        if operation == "installed":
+                            op = "install"
+                        elif operation == "removed":
+                            op = "remove"
+                        elif operation == "purged":
+                            op = "purge"
+                        else:
+                            op = operation
+                        
+                        records.append(HistoryRecord(
+                            timestamp=timestamp,
+                            operation=op,
+                            package_name=package_name.lower(),
+                            version=version,
+                            arch=arch
+                        ))
+                    else:
+                        # 匹配 install/remove/purge 行（操作行）
+                        # 格式: timestamp install/remove package:arch old_version new_version
+                        action_match = re.match(
+                            r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) (install|remove|purge) (.+?)(?::([a-z0-9]+))? (.+)',
+                            line
+                        )
+                        if action_match:
+                            timestamp = action_match.group(1)
+                            operation = action_match.group(2)
+                            package_name = action_match.group(3)
+                            arch = action_match.group(4) or ""
+                            version_parts = action_match.group(5).split()
+                            # 取最后一个版本号（新版本），跳过 <无>
+                            version = version_parts[-1] if version_parts and version_parts[-1] != "<无>" else (version_parts[0] if version_parts else "unknown")
+                            
+                            records.append(HistoryRecord(
+                                timestamp=timestamp,
+                                operation=operation,
+                                package_name=package_name.lower(),
+                                version=version,
+                                arch=arch
+                            ))
+        except PermissionError:
+            print(f"⚠️  无法读取 {self.dpkg_log}，需要权限", file=sys.stderr)
+        except Exception as e:
+            print(f"⚠️  解析日志文件失败: {e}", file=sys.stderr)
+        
+        return records
+    
+    def get_package_history(self, package_name: str) -> List[HistoryRecord]:
+        """获取指定包的历史记录"""
+        all_records = self._parse_dpkg_log()
+        package_name_lower = package_name.lower()
+        return [r for r in all_records if r.package_name == package_name_lower]
+    
+    def get_all_history(self) -> List[HistoryRecord]:
+        """获取所有历史记录"""
+        return self._parse_dpkg_log()
+    
+    def get_recent_history(self, days: int = 30) -> List[HistoryRecord]:
+        """获取最近 N 天的历史记录"""
+        all_records = self._parse_dpkg_log()
+        cutoff_date = datetime.now() - timedelta(days=days)
+        
+        recent_records = []
+        for record in all_records:
+            try:
+                record_date = datetime.strptime(record.timestamp, "%Y-%m-%d %H:%M:%S")
+                if record_date >= cutoff_date:
+                    recent_records.append(record)
+            except ValueError:
+                continue
+        
+        return recent_records
+
+
+class PackageInstaller:
+    """负责包的安装和卸载"""
+    
+    def __init__(self, url: str, arch: str):
+        self.url = url.rstrip("/") + "/" if not url.endswith("/") else url
+        self.arch = arch
+    
+    def install(self, package_name: str) -> bool:
+        """
+        从远程安装指定包
+        
+        Args:
+            package_name: 包名
+            
+        Returns:
+            是否安装成功
+        """
+        # 构建完整的 URL
+        url = self.url
+        if f"/{self.arch}/" not in url:
+            url = url.rstrip("/") + f"/{self.arch}/"
+        
+        # 获取远程包列表
+        remote_packages = RemotePackageManager.fetch_packages(url, self.arch)
+        # 只选择最新版本（与info命令保持一致）
+        remote_packages = get_latest_packages(remote_packages)
+        
+        # 查找匹配的包（大小写不敏感）
+        package_name_lower = package_name.lower()
+        target_pkg = None
+        for pkg in remote_packages:
+            if pkg.name.lower() == package_name_lower:
+                target_pkg = pkg
+                break
+        
+        if not target_pkg:
+            print(f"❌ 未找到包: {package_name}")
+            return False
+        
+        # 下载 .deb 文件
+        deb_url = url + target_pkg.filename
+        print(f"ℹ️  正在下载: {target_pkg.filename}")
+        
+        try:
+            with NamedTemporaryFile(delete=False, suffix=".deb") as tmp_file:
+                tmp_path = tmp_file.name
+                urlretrieve(deb_url, tmp_path)
+            
+            # 安装包
+            print(f"ℹ️  正在安装: {target_pkg.name} {target_pkg.version}")
+            result = subprocess.run(
+                ["sudo", "dpkg", "-i", tmp_path],
+                check=False
+            )
+            
+            # 清理临时文件
+            Path(tmp_path).unlink()
+            
+            if result.returncode == 0:
+                print(f"✅ 安装成功: {target_pkg.name} {target_pkg.version}")
+                return True
+            else:
+                print(f"⚠️  安装可能失败，返回码: {result.returncode}")
+                print("ℹ️  尝试修复依赖关系...")
+                subprocess.run(["sudo", "apt-get", "install", "-f", "-y"], check=False)
+                return False
+        except Exception as e:
+            print(f"❌ 安装失败: {e}", file=sys.stderr)
+            return False
+    
+    def uninstall(self, package_name: str) -> bool:
+        """
+        卸载指定包
+        
+        Args:
+            package_name: 包名
+            
+        Returns:
+            是否卸载成功
+        """
+        print(f"ℹ️  正在卸载: {package_name}")
+        try:
+            result = subprocess.run(
+                ["sudo", "dpkg", "-r", package_name],
+                check=False
+            )
+            
+            if result.returncode == 0:
+                print(f"✅ 卸载成功: {package_name}")
+                return True
+            else:
+                print(f"❌ 卸载失败，返回码: {result.returncode}", file=sys.stderr)
+                return False
+        except Exception as e:
+            print(f"❌ 卸载失败: {e}", file=sys.stderr)
+            return False
+
+
+if __name__ == "__main__":
+    main()
+
