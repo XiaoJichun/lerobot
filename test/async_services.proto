@@ -1,0 +1,41 @@
+// pip install grpcio==1.60.0 grpcio-tools==1.60.0
+// python -m grpc_tools.protoc -I src --python_out=src --grpc_python_out=src src/lerobot/transport/services.proto
+// python -m grpc_tools.protoc -I test --python_out=test --grpc_python_out=test test/async_services.proto
+
+  // python -m grpc_tools.protoc: 调用Python的gRPC工具包中的Protobuf编译器（替代原生protoc命令，无需单独安装protoc）
+  // -I src: --proto_path 的简写，指定Protobuf导入路径（即 .proto 文件中import 其他 proto 的查找目录）；这里指定 src 为根目录，确保proto中引用的其他文件能被找到
+  // --python_out=src: 指定消息类代码的输出目录：生成包含 Observation/Actions/Empty 等消息类的 .py 文件，输出到 src 目录
+  // --grpc_python_out=src	指定gRPC服务代码的输出目录：生成包含 AsyncInferenceServicer（服务端基类）和 AsyncInferenceStub（客户端桩类）的 .py 文件，输出到 src 目录
+  // src/lerobot/transport/services.proto	要编译的 Protobuf 源文件路径（必填）
+
+syntax = "proto3";
+
+package policy_service;
+
+// 定义服务AsyncInference: 从机器人角度, 机器人将观察结果发送到并执行从远程策略服务器接收到的操作
+service AsyncInference {
+  //机器人 -> 与远程推理服务器共享观察结果的策略
+  //策略 ->  机器人共享针对给定观察结果预测的操作
+  rpc SendObservations(stream InferObservation) returns (Empty);
+  rpc GetActions(Empty) returns (InferActions);
+  rpc Ready(Empty) returns (Empty);
+}
+
+message Empty {
+}
+
+message ServerMetadata {
+  map<string, string> metadata = 1;
+}
+
+message InferObservation {
+  // Serialized observation data (msgpack format)
+  bytes data = 1;
+}
+
+message InferActions {
+  // Serialized action data (msgpack format)
+  bytes data = 1;
+  // Error message if inference failed
+  string error = 2;
+}
