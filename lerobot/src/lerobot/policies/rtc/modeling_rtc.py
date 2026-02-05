@@ -254,10 +254,18 @@ class RTCProcessor:
         tau_tensor = torch.as_tensor(tau)
             # 计算 (1 - τ)²，是 RTC 论文中的标准公式项
         squared_one_minus_tau = (1 - tau_tensor) ** 2
-            # 基于时间的动态调整（inv_r2 是时间的函数）
+            # 计算 inv_r2 = [(1-τ)² + τ²] / (1-τ)² 动态调整权重的缩放因子，让权重随时间平滑变化
         inv_r2 = (squared_one_minus_tau + tau_tensor**2) / (squared_one_minus_tau)
+
+        # 核心公式：c = (1 - τ) / τ；
+        # torch.nan_to_num：处理异常值：
+        #     当 τ→0 时，(1-τ)/τ → +∞ → 替换为 max_guidance_weight；
+        #     当 τ=0 时，出现 NaN → 同样替换为 max_guidance_weight；
+        # 作用：避免除零错误，同时限制 c 的上限。
         c = torch.nan_to_num((1 - tau_tensor) / tau_tensor, posinf=max_guidance_weight)
+        # 计算最终的引导权重：引导权重 = c * inv_r2
         guidance_weight = torch.nan_to_num(c * inv_r2, posinf=max_guidance_weight)
+        # 最终兜底：将引导权重限制在 max_guidance_weight 以内
         guidance_weight = torch.minimum(guidance_weight, max_guidance_weight)
 
         # 9. 应用修正：生成最终的引导速度 （用引导权重缩放修正量，然后从基础速度中减去，得到最终的引导速度（核心输出））
