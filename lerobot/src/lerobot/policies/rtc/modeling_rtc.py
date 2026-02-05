@@ -35,7 +35,8 @@ logger = logging.getLogger(__name__)
 
 
 class RTCProcessor:
-    """Real-Time Chunking processor for action chunking policies.
+    """Real-Time Chunking processor for action chunking policies:
+        在模型推理过程中，利用上一个未执行完的动作块（prefix）来引导当前动作块的生成，从而实现更平滑、更实时的机器人动作控制。
 
     This class implements RTC techniques including velocity calculation,
     prefix attention, and adaptive chunk processing.
@@ -67,7 +68,8 @@ class RTCProcessor:
         execution_horizon: int | None = None,
         **metadata,
     ) -> None:
-        """Proxy method to track debug information.
+        """Proxy method to track debug information:
+            在不侵入核心逻辑的前提下，实现调试数据的记录和管理
 
         If tracker is None or disabled, this method does nothing.
         Otherwise, it forwards the call to tracker.track().
@@ -88,18 +90,16 @@ class RTCProcessor:
             )
 
     def get_all_debug_steps(self) -> list:
-        """Get all debug steps from tracker.
-
-        Returns empty list if tracker is disabled or None.
+        """
+            获取所有调试记录的步骤数据，调试模式关闭时返回空列表。
         """
         if self.tracker is not None:
             return self.tracker.get_all_steps()
         return []
 
     def is_debug_enabled(self) -> bool:
-        """Check if debug tracking is enabled.
-
-        Returns True if tracker exists and is enabled.
+        """
+           检查调试模式是否开启（跟踪器存在且启用）
         """
         return self.tracker is not None and self.tracker.enabled
 
@@ -115,14 +115,25 @@ class RTCProcessor:
 
     def denoise_step(
         self,
-        x_t,
-        prev_chunk_left_over,
-        inference_delay,
-        time,
-        original_denoise_step_partial,
-        execution_horizon=None,
+        x_t,                            # 当前待去噪的状态/动作张量 (B, T, A) 或 (T, A)
+        prev_chunk_left_over,           # 上一个动作块的剩余部分(未执行完)动作块(B, T_prev, A) 或 (T_prev, A)
+        inference_delay,                # 用于引导的时间步数量（推理时间步）
+        time,                           # 归一化时间（0~1），标量/Tensor
+        original_denoise_step_partial,  # 原始去噪函数（输入x_t，输出基础速度v_t）
+        execution_horizon=None,         # 执行视野（ 聚合的时间步   参与引导的最大时间步）
     ) -> Tensor:
-        """RTC guidance wrapper around an existing denoiser.
+        """
+        封装原始的去噪函数，添加RTC前缀引导逻辑，生成更平滑的动作速度，让模型生成的动作序列更平滑、更贴合历史动作，以实现实时机器人控制
+
+        x_t：当前要降噪的潜在/状态。形状“(B，T，A)”或“(T，A)”。
+        prev_chunk_left_over (Tensor | None): 前一个chunk未执行的动作块。形状“(B，T_prev，A)”或“(T_prev，A)”。如果“无”，则没有指导
+        inference_delay (int)：推理延迟的时间步数。
+        time (float | Tensor)：[0, 1] 中的标量，表示标准化时间。
+        Original_enoise_step_partial (Callable[[Tensor], Tensor]): 计算仅给定“x_t”的基本降噪速度
+        execution_horizon (int | None)：chunk大小
+        
+        
+        RTC guidance wrapper around an existing denoiser.
 
         This method wraps an original denoising callable that only takes ``x_t`` and
         returns a base denoised velocity ``v_t``. It then applies Real-Time Chunking
@@ -136,8 +147,7 @@ class RTCProcessor:
             inference_delay (int): Number of timesteps from the prefix to use for guidance.
             time (float | Tensor): Scalar in [0, 1] indicating normalized time. Must be
                 broadcastable with ``x_t``.
-            original_denoise_step_partial (Callable[[Tensor], Tensor]): Callable that
-                computes the base denoised velocity given only ``x_t``.
+            original_denoise_step_partial (Callable[[Tensor], Tensor]): Callable that computes the base denoised velocity given only ``x_t``.
             execution_horizon (int | None): Horizon used to build prefix weights. If
                 ``None``, defaults to ``self.rtc_config.execution_horizon``.
 
@@ -158,18 +168,18 @@ class RTCProcessor:
             https://www.physicalintelligence.company/download/real_time_chunking.pdf
         """
 
-        # In the original implementation, the time goes from 0 to 1 and
-        # In our implementation, the time goes from 1 to 0
-        # So we need to invert the time
+        # 1. 在论文中，时间从 0 到 1
+        # 在代码实现上，时间从 1 到 0     ： 需要反转时间
         tau = 1 - time
 
+        # 2. 无前缀时直接返回原始去噪结果
         if prev_chunk_left_over is None:
             # First step, no guidance - return v_t
             v_t = original_denoise_step_partial(x_t)
             return v_t
 
+        # 3. 张量预处理（保证维度一致性）
         x_t = x_t.clone().detach()
-
         squeezed = False
         if len(x_t.shape) < 3:
             # Add batch dimension
@@ -180,6 +190,7 @@ class RTCProcessor:
             # Add batch dimension
             prev_chunk_left_over = prev_chunk_left_over.unsqueeze(0)
 
+        # 4. 执行视野： 去头去尾中间值
         if execution_horizon is None:
             execution_horizon = self.rtc_config.execution_horizon
 
@@ -188,6 +199,7 @@ class RTCProcessor:
         if execution_horizon > prev_chunk_left_over.shape[1]:
             execution_horizon = prev_chunk_left_over.shape[1]
 
+        # 5. 前缀补零（保证与当前块维度一致）
         batch_size = x_t.shape[0]
         action_chunk_size = x_t.shape[1]
         action_dim = x_t.shape[2]
@@ -201,6 +213,7 @@ class RTCProcessor:
             "The padded previous chunk must be the same size as the input tensor"
         )
 
+        # 6. 生成前缀注意力权重
         weights = (
             self.get_prefix_weights(inference_delay, execution_horizon, action_chunk_size)
             .to(x_t.device)
@@ -208,32 +221,56 @@ class RTCProcessor:
             .unsqueeze(-1)
         )
 
+        # 7. 梯度计算（核心：基于前缀的引导修正）：  RTC 引导需要计算梯度，但不希望影响模型整体的梯度状态，因此用上下文管理器限定范围
         with torch.enable_grad():
+            # 调用原始去噪函数，  输入当前状态 x_t，输出无引导的基础速度 v_t
             v_t = original_denoise_step_partial(x_t)
+            # 开启梯度计算：   标记 x_t 为 “需要计算梯度” 的张量；   后续要计算 x1_t 对 x_t 的梯度，必须开启 x_t 的梯度追踪。
             x_t.requires_grad_(True)
 
+            # 预测下一时刻状态 （基于当前状态和速度）
             x1_t = x_t - time * v_t  # noqa: N806
+
+            # 计算上一个剩余动作块与当前预测状态的误差，并乘以注意力权重（只关注需要引导的时间步）
+                # weights的目的： 只关注需要引导的时间步，其余的或者删除，或者完全保留
+                # [B, T, A]
             err = (prev_chunk_left_over - x1_t) * weights
+
+                # 将 err 作为梯度计算的 “输出梯度”，且不希望 err 的梯度被追踪（避免循环计算）
             grad_outputs = err.clone().detach()
+
+            # 计算 x1_t 对 x_t 的梯度（以 err 为梯度输出），这个梯度就是需要修正的量：  目的是让当前预测状态尽可能贴近上一个chunk。
+                    # x1_t	目标张量（求导的因变量）
+                    # x_t	源张量（求导的自变量）
+                    # grad_outputs	输出梯度（链式法则的上游梯度）
+                    # retain_graph	是否保留计算图（False = 不保留，节省内存）
             correction = torch.autograd.grad(x1_t, x_t, grad_outputs, retain_graph=False)[0]
 
+
+        # 8. 计算引导权重（防止过大）
+            # 避免权重过大导致修正过度（通过 max_guidance_weight 限制）
         max_guidance_weight = torch.as_tensor(self.rtc_config.max_guidance_weight)
+            # 将反转后的时间 tau 转为张量（方便后续计算）
         tau_tensor = torch.as_tensor(tau)
+            # 计算 (1 - τ)²，是 RTC 论文中的标准公式项
         squared_one_minus_tau = (1 - tau_tensor) ** 2
+            # 基于时间的动态调整（inv_r2 是时间的函数）
         inv_r2 = (squared_one_minus_tau + tau_tensor**2) / (squared_one_minus_tau)
         c = torch.nan_to_num((1 - tau_tensor) / tau_tensor, posinf=max_guidance_weight)
         guidance_weight = torch.nan_to_num(c * inv_r2, posinf=max_guidance_weight)
         guidance_weight = torch.minimum(guidance_weight, max_guidance_weight)
 
+        # 9. 应用修正：生成最终的引导速度 （用引导权重缩放修正量，然后从基础速度中减去，得到最终的引导速度（核心输出））
         result = v_t - guidance_weight * correction
 
-        # Remove the batch dimension if it was added
+        # 10. 恢复维度（移除临时添加的批次维度）
         if squeezed:
             result = result.squeeze(0)
             correction = correction.squeeze(0)
             x1_t = x1_t.squeeze(0)
             err = err.squeeze(0)
 
+        # 11. 记录调试数据
         self.track(
             time=time,
             x1_t=x1_t,
@@ -250,17 +287,24 @@ class RTCProcessor:
     def get_prefix_weights(self, start, end, total):
         start = min(start, end)
 
+        # 根据不同的注意力策略生成权重
         if self.rtc_config.prefix_attention_schedule == RTCAttentionSchedule.ZEROS:
             weights = torch.zeros(total)
+            # 只关注前缀的前 N 步，简单粗暴： 前start步权重为1，其余为0
             weights[:start] = 1.0
         elif self.rtc_config.prefix_attention_schedule == RTCAttentionSchedule.ONES:
             weights = torch.ones(total)
+            # 关注前缀的前 M 步（M > N），覆盖更多引导范围： 前end步权重为1，其余为0
             weights[end:] = 0.0
         elif self.rtc_config.prefix_attention_schedule == RTCAttentionSchedule.LINEAR:
+            # 线性衰减权重：平滑过渡，避免权重突变
             lin_weights = self._linweights(start, end, total)
+            # 尾部补零
             weights = self._add_trailing_zeros(lin_weights, total, end)
+            # 头部补1
             weights = self._add_leading_ones(weights, start, total)
         elif self.rtc_config.prefix_attention_schedule == RTCAttentionSchedule.EXP:
+            # 指数衰减（基于线性权重） ：更平缓的衰减，重点关注前序步骤
             lin_weights = self._linweights(start, end, total)
             lin_weights = lin_weights * torch.expm1(lin_weights).div(math.e - 1)
             weights = self._add_trailing_zeros(lin_weights, total, end)
@@ -269,13 +313,15 @@ class RTCProcessor:
         return weights
 
     def _linweights(self, start, end, total):
+
+        # 尾部需要跳过的步数
         skip_steps_at_end = max(total - end, 0)
-
+        # 线性衰减的步数
         linspace_steps = total - skip_steps_at_end - start
-
+        # 无衰减步时返回空张量
         if end <= start or linspace_steps <= 0:
             return torch.tensor([])
-
+        # 生成从1到0的线性序列（去掉首尾，避免1和0的重复）
         return torch.linspace(1, 0, linspace_steps + 2)[1:-1]
 
     def _add_trailing_zeros(self, weights, total, end):

@@ -117,23 +117,25 @@ class Tracker:
 
     def reset(self) -> None:
         """Clear all recorded debug information."""
+        # 仅当启用且_steps不为None时，清空字典（避免对None调用clear()报错）
         if self.enabled and self._steps is not None:
             self._steps.clear()
         self._step_counter = 0
 
+    # 禁用torch.compile，避免.item()等操作导致图断裂
     @torch._dynamo.disable
     def track(
         self,
-        time: float | Tensor,
-        x_t: Tensor | None = None,
-        v_t: Tensor | None = None,
-        x1_t: Tensor | None = None,
-        correction: Tensor | None = None,
-        err: Tensor | None = None,
-        weights: Tensor | None = None,
-        guidance_weight: float | Tensor | None = None,
-        inference_delay: int | None = None,
-        execution_horizon: int | None = None,
+        time: float | Tensor,               # 时间参数（核心键值）
+        x_t: Tensor | None = None,          # 当前隐变量/状态张量
+        v_t: Tensor | None = None,          # 去噪器输出的速度张量
+        x1_t: Tensor | None = None,         # 去噪后的预测张量
+        correction: Tensor | None = None,   # 校正梯度张量
+        err: Tensor | None = None,          # 加权误差项
+        weights: Tensor | None = None,      # 前缀注意力权重
+        guidance_weight: float | Tensor | None = None,   # 应用的引导权重
+        inference_delay: int | None = None,              # 推理延迟参数
+        execution_horizon: int | None = None,            # 执行范围参数
         **metadata,
     ) -> None:
         """Track debug information for a denoising step at a given time.
@@ -157,6 +159,8 @@ class Tracker:
             execution_horizon (int | None): Execution horizon parameter.
             **metadata: Additional metadata to store.
         """
+
+        # 如果未启用，直接返回，不执行后续逻辑
         if not self.enabled:
             return
 
@@ -164,7 +168,8 @@ class Tracker:
         time_value = time.item() if isinstance(time, Tensor) else time
         time_key = round(time_value, 6)  # Use rounded time as dictionary key
 
-        # Check if step with this time already exists
+        # 转换时间为float并四舍五入，避免浮点精度问题（如0.1+0.2≠0.3），确保相同时间的步骤能被正确匹配
+            # 比如 0.100000001 和 0.1 会被统一为 0.1
         if time_key in self._steps:
             # Update existing step with non-None fields
             existing_step = self._steps[time_key]

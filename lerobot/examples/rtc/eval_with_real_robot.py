@@ -106,7 +106,7 @@ from lerobot.utils.utils import init_logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-
+# 机器人线程安全封装：封装后，所有线程操作机器人必须通过 RobotWrapper，而非直接操作原始 Robot 实例，从根本上保证线程安全。
 class RobotWrapper:
     def __init__(self, robot: Robot):
         self.robot = robot
@@ -148,21 +148,20 @@ class RTCDemoConfig(HubMixin):
         )
     )
 
-    # Demo parameters
+    # 演示参数：运行时长（秒）、动作执行频率（Hz）
     duration: float = 30.0  # Duration to run the demo (seconds)
     fps: float = 10.0  # Action execution frequency (Hz)
 
     # Compute device
     device: str | None = None  # Device to run on (cuda, cpu, auto)
 
-    # Get new actions horizon. The amount of executed steps after which will be requested new actions.
-    # It should be higher than inference delay + execution horizon.
+    # 触发新动作块的队列阈值：需 > 推理延迟+RTC执行视野，防止动作队列空跑
     action_queue_size_to_get_new_actions: int = 30
 
     # Task to execute
     task: str = field(default="", metadata={"help": "Task to execute"})
 
-    # Torch compile configuration
+    # Torch 编译配置：是否启用、后端、模式等（适配 PyTorch 2.0+ 加速）
     use_torch_compile: bool = field(
         default=False,
         metadata={"help": "Use torch.compile for faster inference (PyTorch 2.0+)"},
@@ -188,6 +187,7 @@ class RTCDemoConfig(HubMixin):
 
     def __post_init__(self):
         # HACK: We parse again the cli args here to get the pretrained path if there was one.
+        # 初始化后校验：强制要求传入策略路径，否则抛异常
         policy_path = parser.get_path_arg("policy")
         if policy_path:
             cli_overrides = parser.get_cli_overrides("policy")
@@ -196,13 +196,15 @@ class RTCDemoConfig(HubMixin):
         else:
             raise ValueError("Policy path is required")
 
-        # Validate that robot configuration is provided
+        # 强制要求传入机器人配置
         if self.robot is None:
             raise ValueError("Robot configuration must be provided")
 
     @classmethod
     def __get_path_fields__(cls) -> list[str]:
         """This enables the parser to load config from the policy using `--policy.path=local/dir`"""
+        # 告诉解析器：policy 字段支持从 Hub/本地路径加载配置（--policy.path=xxx）
+        # __get_path_fields__ 是 lerobot 框架约定，支持命令行参数解析器加载远程 / 本地策略配置
         return ["policy"]
 
 
@@ -218,7 +220,11 @@ def get_actions(
     shutdown_event: Event,
     cfg: RTCDemoConfig,
 ):
-    """Thread function to request action chunks from the policy.
+    """
+    核心工作线程 1: 动作块请求线程 
+        后台持续运行，当动作队列剩余量低于阈值时，从机器人获取最新观测 → 预处理 → 调用策略生成RTC动作块 → 将动作块合并到线程安全的动作队列，为执行线程提供「动作储备」。
+
+    Thread function to request action chunks from the policy.
 
     Args:
         policy: The policy instance (SmolVLA, Pi0, etc.)
@@ -231,10 +237,12 @@ def get_actions(
     try:
         logger.info("[GET_ACTIONS] Starting get actions thread")
 
+        # 1. 初始化延迟跟踪器：记录策略推理延迟，用于RTC推理延迟补偿
         latency_tracker = LatencyTracker()  # Track latency of action chunks
         fps = cfg.fps
         time_per_chunk = 1.0 / fps
 
+        # 2. 构建数据集特征：将机器人观测特征转换为策略要求的数据集格式
         dataset_features = hw_to_dataset_features(robot.observation_features(), "observation")
         policy_device = policy.config.device
 
@@ -242,6 +250,7 @@ def get_actions(
         # The stats are embedded in the processor .safetensors files
         logger.info(f"[GET_ACTIONS] Loading preprocessor/postprocessor from {cfg.policy.pretrained_path}")
 
+        # 3. 加载策略的预处理器/后处理器：含归一化、图像缩放等统计信息（从预训练文件加载）
         preprocessor, postprocessor = make_pre_post_processors(
             policy_cfg=cfg.policy,
             pretrained_path=cfg.policy.pretrained_path,
@@ -253,29 +262,35 @@ def get_actions(
 
         logger.info("[GET_ACTIONS] Preprocessor/postprocessor loaded successfully with embedded stats")
 
+        # 4. 设置动作块请求阈值：RTC禁用时阈值为0（立即请求），启用时用配置值
         get_actions_threshold = cfg.action_queue_size_to_get_new_actions
-
         if not cfg.rtc.enabled:
             get_actions_threshold = 0
 
+        # 主循环：直到收到关闭信号才退出
         while not shutdown_event.is_set():
+
+            # 核心触发条件：动作队列剩余量 ≤ 阈值 → 开始请求新动作块
             if action_queue.qsize() <= get_actions_threshold:
                 current_time = time.perf_counter()
+                # 5. 获取当前队列的动作执行索引（用于RTC动作块对齐）
                 action_index_before_inference = action_queue.get_action_index()
+                    # 获取上一个动作块执行后剩余的未执行动作（用于RTC连续推理）
                 prev_actions = action_queue.get_left_over()
 
+                # 6. 推理延迟补偿：基于历史最大延迟，计算需要提前补偿的步数
                 inference_latency = latency_tracker.max()
                 inference_delay = math.ceil(inference_latency / time_per_chunk)
 
+                # 7.机器人层预处理（格式转换等）
                 obs = robot.get_observation()
-
-                # Apply robot observation processor
                 obs_processed = robot_observation_processor(obs)
 
+                # 8. 观测格式转换：适配策略输入要求（构建数据集帧格式）
                 obs_with_policy_features = build_dataset_frame(
                     dataset_features, obs_processed, prefix="observation"
                 )
-
+                    # 张量转换+设备迁移：numpy→torch张量，图像归一化/维度调整，移到策略设备
                 for name in obs_with_policy_features:
                     obs_with_policy_features[name] = torch.from_numpy(obs_with_policy_features[name])
                     if "image" in name:
@@ -288,36 +303,40 @@ def get_actions(
                     obs_with_policy_features[name] = obs_with_policy_features[name].unsqueeze(0)
                     obs_with_policy_features[name] = obs_with_policy_features[name].to(policy_device)
 
+                # 9.补充任务描述和机器人类型：策略的关键输入
                 obs_with_policy_features["task"] = [cfg.task]  # Task should be a list, not a string!
                 obs_with_policy_features["robot_type"] = (
                     robot.robot.name if hasattr(robot.robot, "name") else ""
                 )
-
+                # 10. 策略层观测预处理：应用预训练的统计信息（归一化、标准化等）
                 preproceseded_obs = preprocessor(obs_with_policy_features)
 
-                # Generate actions WITH RTC
+                # 11. 核心：调用策略生成RTC动作块
                 actions = policy.predict_action_chunk(
                     preproceseded_obs,
                     inference_delay=inference_delay,
                     prev_chunk_left_over=prev_actions,
                 )
 
-                # Store original actions (before postprocessing) for RTC
+                # 12. 动作后处理：分离原始动作（用于RTC内部）和后处理动作（用于机器人执行）
                 original_actions = actions.squeeze(0).clone()
 
                 postprocessed_actions = postprocessor(actions)
 
                 postprocessed_actions = postprocessed_actions.squeeze(0)
 
+                # 13. 跟踪本次推理延迟：更新延迟统计，计算本次补偿步数
                 new_latency = time.perf_counter() - current_time
                 new_delay = math.ceil(new_latency / time_per_chunk)
                 latency_tracker.add(new_latency)
 
+                # 14. 阈值校验：若配置的阈值 < 推理延迟+RTC执行视野，报警告（防止队列空）
                 if cfg.action_queue_size_to_get_new_actions < cfg.rtc.execution_horizon + new_delay:
                     logger.warning(
                         "[GET_ACTIONS] cfg.action_queue_size_to_get_new_actions Too small, It should be higher than inference delay + execution horizon."
                     )
-
+                    
+                # 15. 合并动作块到队列：RTC核心步骤，保证动作块与当前执行索引对齐
                 action_queue.merge(
                     original_actions, postprocessed_actions, new_delay, action_index_before_inference
                 )
@@ -339,7 +358,11 @@ def actor_control(
     shutdown_event: Event,
     cfg: RTCDemoConfig,
 ):
-    """Thread function to execute actions on the robot.
+    """
+    核心工作线程 2: 机器人动作执行线程
+        以固定频率（配置的 fps）从动作队列中取出单步动作 → 预处理 → 发送给机器人执行，是机器人的实际控制入口，保证动作执行的实时性和稳定性。
+
+    Thread function to execute actions on the robot.
 
     Args:
         robot: The robot instance
@@ -378,7 +401,12 @@ def actor_control(
 
 
 def _apply_torch_compile(policy, cfg: RTCDemoConfig):
-    """Apply torch.compile to the policy's predict_action_chunk method.
+    """
+    策略加速模块：
+        为策略的 predict_action_chunk 方法应用 PyTorch 2.0+ 原生编译（torch.compile），提升 RTC 动作块的推理速度，降低延迟；同时对 PI0/PI0.5 策略做特殊处理（自身已实现编译逻辑）
+    
+    
+    Apply torch.compile to the policy's predict_action_chunk method.
 
     Args:
         policy: Policy instance to compile
@@ -428,76 +456,81 @@ def _apply_torch_compile(policy, cfg: RTCDemoConfig):
 
     return policy
 
-
+# @parser.wrap() 自动解析命令行参数，无需手动处理，提升易用性
 @parser.wrap()
 def demo_cli(cfg: RTCDemoConfig):
     """Main entry point for RTC demo with draccus configuration."""
 
-    # Initialize logging
+    # 1. 初始化日志：统一日志格式
     init_logging()
 
     logger.info(f"Using device: {cfg.device}")
 
-    # Setup signal handler for graceful shutdown
+    # 2. 初始化优雅关闭信号：处理Ctrl+C/系统退出信号，生成全局shutdown_event
     signal_handler = ProcessSignalHandler(use_threads=True, display_pid=False)
     shutdown_event = signal_handler.shutdown_event
 
+    # 3. 初始化资源变量：提前声明，方便后续异常清理
     policy = None
     robot = None
     get_actions_thread = None
     actor_thread = None
 
+    # 4. 加载策略：根据策略类型获取类，加载预训练模型（支持PEFT微调模型）
     policy_class = get_policy_class(cfg.policy.type)
 
-    # Load config and set compile_model for pi0/pi05 models
     config = PreTrainedConfig.from_pretrained(cfg.policy.pretrained_path)
 
     if cfg.policy.type == "pi05" or cfg.policy.type == "pi0":
         config.compile_model = cfg.use_torch_compile
 
+        # 支持PEFT微调模型：加载基础模型 + PEFT适配器
     if config.use_peft:
         from peft import PeftConfig, PeftModel
 
         peft_pretrained_path = cfg.policy.pretrained_path
         peft_config = PeftConfig.from_pretrained(peft_pretrained_path)
-
+        # 加载基础模型
         policy = policy_class.from_pretrained(
             pretrained_name_or_path=peft_config.base_model_name_or_path, config=config
         )
+        # 加载PEFT适配器
         policy = PeftModel.from_pretrained(policy, peft_pretrained_path, config=peft_config)
     else:
+        # 加载普通预训练模型
         policy = policy_class.from_pretrained(cfg.policy.pretrained_path, config=config)
 
-    # Turn on RTC
+    # 5. 启用RTC：将RTC配置传入策略，初始化RTC处理器（即使配置中RTC禁用，也强制初始化）
     policy.config.rtc_config = cfg.rtc
 
     # Init RTC processort, as by default if RTC disabled in the config
     # The processor won't be created
     policy.init_rtc_processor()
-
+        # 校验：仅支持SmolVLA/PI0/PI05策略的RTC
     assert policy.name in ["smolvla", "pi05", "pi0"], "Only smolvla, pi05, and pi0 are supported for RTC"
 
+    # 6. 策略设备迁移+推理模式：移到指定设备（cuda/mps/cpu），设置为eval模式（关闭Dropout等）
     policy = policy.to(cfg.device)
     policy.eval()
 
-    # Apply torch.compile to predict_action_chunk method if enabled
+    # 7. 策略加速：应用torch.compile（若配置启用）
     if cfg.use_torch_compile:
         policy = _apply_torch_compile(policy, cfg)
 
-    # Create robot
+    # 8. 创建并初始化真实机器人：从配置生成机器人实例，建立连接
     logger.info(f"Initializing robot: {cfg.robot.type}")
     robot = make_robot_from_config(cfg.robot)
     robot.connect()
     robot_wrapper = RobotWrapper(robot)
 
-    # Create robot observation processor
+    # 9. 创建机器人处理器：观测和动作的基础预处理（适配机器人原始数据）
     robot_observation_processor = make_default_robot_observation_processor()
     robot_action_processor = make_default_robot_action_processor()
 
-    # Create action queue for communication between threads
+    # 10. 创建RTC动作队列：线程间动作通信的核心（线程安全，支持动作块合并/索引对齐）
     action_queue = ActionQueue(cfg.rtc)
 
-    # Start chunk requester thread
+    # 11. 启动动作块请求线程：GetActions线程，后台生成动作块
     get_actions_thread = Thread(
         target=get_actions,
         args=(policy, robot_wrapper, robot_observation_processor, action_queue, shutdown_event, cfg),
@@ -507,7 +540,7 @@ def demo_cli(cfg: RTCDemoConfig):
     get_actions_thread.start()
     logger.info("Started get actions thread")
 
-    # Start action executor thread
+    # 12. 启动机器人执行线程：Actor线程，实时执行动作
     actor_thread = Thread(
         target=actor_control,
         args=(robot_wrapper, robot_action_processor, action_queue, shutdown_event, cfg),
@@ -519,14 +552,15 @@ def demo_cli(cfg: RTCDemoConfig):
 
     logger.info("Started stop by duration thread")
 
-    # Main thread monitors for duration or shutdown
+    # 13. 主循环：监控运行时长/关闭信号，周期性打印队列状态
     logger.info(f"Running demo for {cfg.duration} seconds...")
     start_time = time.time()
 
     while not shutdown_event.is_set() and (time.time() - start_time) < cfg.duration:
+        # 每10秒检查一次，关闭信号和时长，避免频繁检查导致性能问题
         time.sleep(10)
 
-        # Log queue status periodically
+        # 每5秒打印一次队列状态（用于监控，避免日志过多）
         if int(time.time() - start_time) % 5 == 0:
             logger.info(f"[MAIN] Action queue size: {action_queue.qsize()}")
 
@@ -535,10 +569,11 @@ def demo_cli(cfg: RTCDemoConfig):
 
     logger.info("Demo duration reached or shutdown requested")
 
-    # Signal shutdown
+    # 14. 触发优雅关闭：设置全局关闭信号，通知所有线程退出
     shutdown_event.set()
 
-    # Wait for threads to finish
+    # 15. 资源清理：无论是否发生异常，都保证资源正确释放（最关键的容错步骤）
+        # 等待工作线程退出：确保线程完成当前操作，避免资源泄漏
     if get_actions_thread and get_actions_thread.is_alive():
         logger.info("Waiting for chunk requester thread to finish...")
         get_actions_thread.join()
@@ -547,7 +582,7 @@ def demo_cli(cfg: RTCDemoConfig):
         logger.info("Waiting for action executor thread to finish...")
         actor_thread.join()
 
-    # Cleanup robot
+    # 断开机器人连接：释放物理资源，避免机器人处于异常状态
     if robot:
         robot.disconnect()
         logger.info("Robot disconnected")
